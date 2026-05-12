@@ -11,7 +11,7 @@ go get github.com/mtgo-labs/storage/postgres
 ## Usage
 
 ```go
-store, err := postgres.Open(postgres.Config{
+ext, err := postgres.Open(postgres.Config{
     Host:     "localhost",
     Port:     5432,
     User:     "mtgo",
@@ -22,9 +22,14 @@ store, err := postgres.Open(postgres.Config{
 if err != nil {
     log.Fatal(err)
 }
-defer store.Close()
+defer ext.Close()
 
-client, _ := telegram.NewClient(apiID, apiHash, telegram.WithStorage(store))
+client, err := tg.NewClient(mustAtoi(apiID), apiHash, &tg.Config{
+    BotToken:    botToken,
+    SessionName: "storage_bot",
+    SavePeers:   true,
+    Storage:     storage.NewAdapter(ext),
+})
 ```
 
 `Open` connects to the database, verifies connectivity with `Ping`, and initializes the `sessions` and `peers` tables. The `conversations` table is created lazily on first use.

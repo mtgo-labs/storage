@@ -11,13 +11,18 @@ go get github.com/mtgo-labs/storage/sqlite
 ## Usage
 
 ```go
-store, err := sqlite.Open("session.db")
+ext, err := sqlite.Open("session.db")
 if err != nil {
     log.Fatal(err)
 }
-defer store.Close()
+defer ext.Close()
 
-client, _ := telegram.NewClient(apiID, apiHash, telegram.WithStorage(store))
+client, err := tg.NewClient(mustAtoi(apiID), apiHash, &tg.Config{
+    BotToken:    botToken,
+    SessionName: "storage_bot",
+    SavePeers:   true,
+    Storage:     storage.NewAdapter(ext),
+})
 ```
 
 `Open` creates the database file if it doesn't exist and initializes the `sessions` and `peers` tables. The `conversations` table is created lazily on first use.

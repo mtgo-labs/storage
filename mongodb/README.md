@@ -11,16 +11,21 @@ go get github.com/mtgo-labs/storage/mongodb
 ## Usage
 
 ```go
-store, err := mongodb.Open(ctx, mongodb.Config{
+ext, err := mongodb.Open(ctx, mongodb.Config{
     URI:      "mongodb://localhost:27017",
     Database: "mtgo",
 })
 if err != nil {
     log.Fatal(err)
 }
-defer store.Close()
+defer ext.Close()
 
-client, _ := telegram.NewClient(apiID, apiHash, telegram.WithStorage(store))
+client, err := tg.NewClient(mustAtoi(apiID), apiHash, &tg.Config{
+    BotToken:    botToken,
+    SessionName: "storage_bot",
+    SavePeers:   true,
+    Storage:     storage.NewAdapter(ext),
+})
 ```
 
 `Open` connects to the cluster, verifies connectivity with `Ping`, and creates indexes for peer username lookups and conversation composite queries. Collections are created implicitly on first use.

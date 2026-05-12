@@ -32,19 +32,24 @@ go get github.com/mtgo-labs/storage/mongodb
 ### SQLite
 
 ```go
-store, err := sqlite.Open("session.db")
+ext, err := sqlite.Open("session.db")
 if err != nil {
     log.Fatal(err)
 }
-defer store.Close()
+defer ext.Close()
 
-client, _ := telegram.NewClient(apiID, apiHash, telegram.WithStorage(storage.NewAdapter(store)))
+client, err := tg.NewClient(mustAtoi(apiID), apiHash, &tg.Config{
+    BotToken:    botToken,
+    SessionName: "storage_bot",
+    SavePeers:   true,
+    Storage:     storage.NewAdapter(ext),
+})
 ```
 
 ### PostgreSQL
 
 ```go
-store, err := postgres.Open(postgres.Config{
+ext, err := postgres.Open(postgres.Config{
     Host:     "localhost",
     Port:     5432,
     User:     "mtgo",
@@ -55,24 +60,34 @@ store, err := postgres.Open(postgres.Config{
 if err != nil {
     log.Fatal(err)
 }
-defer store.Close()
+defer ext.Close()
 
-client, _ := telegram.NewClient(apiID, apiHash, telegram.WithStorage(storage.NewAdapter(store)))
+client, err := tg.NewClient(mustAtoi(apiID), apiHash, &tg.Config{
+    BotToken:    botToken,
+    SessionName: "storage_bot",
+    SavePeers:   true,
+    Storage:     storage.NewAdapter(ext),
+})
 ```
 
 ### MongoDB
 
 ```go
-store, err := mongodb.Open(ctx, mongodb.Config{
+ext, err := mongodb.Open(ctx, mongodb.Config{
     URI:      "mongodb://localhost:27017",
     Database: "mtgo",
 })
 if err != nil {
     log.Fatal(err)
 }
-defer store.Close()
+defer ext.Close()
 
-client, _ := telegram.NewClient(apiID, apiHash, telegram.WithStorage(storage.NewAdapter(store)))
+client, err := tg.NewClient(mustAtoi(apiID), apiHash, &tg.Config{
+    BotToken:    botToken,
+    SessionName: "storage_bot",
+    SavePeers:   true,
+    Storage:     storage.NewAdapter(ext),
+})
 ```
 
 Note: Backends implement [`storage.Adapter`](storage.go) (`SessionStore` + `PeerStore` + `Close`). The [`storage.NewAdapter`](adapter.go) wrapper bridges that interface into the client's [`Storage`](storage.go) interface.
