@@ -1,4 +1,8 @@
+<div align="center">
+
 # storage
+
+</div>
 
 Persistent storage adapters for [mtgo] Telegram clients — session data, peer cache, and conversation state.
 
