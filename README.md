@@ -38,7 +38,7 @@ if err != nil {
 }
 defer store.Close()
 
-client, _ := telegram.NewClient(apiID, apiHash, telegram.WithStorage(store))
+client, _ := telegram.NewClient(apiID, apiHash, telegram.WithStorage(storage.NewAdapter(store)))
 ```
 
 ### PostgreSQL
@@ -57,7 +57,7 @@ if err != nil {
 }
 defer store.Close()
 
-client, _ := telegram.NewClient(apiID, apiHash, telegram.WithStorage(store))
+client, _ := telegram.NewClient(apiID, apiHash, telegram.WithStorage(storage.NewAdapter(store)))
 ```
 
 ### MongoDB
@@ -72,8 +72,10 @@ if err != nil {
 }
 defer store.Close()
 
-client, _ := telegram.NewClient(apiID, apiHash, telegram.WithStorage(store))
+client, _ := telegram.NewClient(apiID, apiHash, telegram.WithStorage(storage.NewAdapter(store)))
 ```
+
+Note: Backends implement [`storage.Adapter`](storage.go) (`SessionStore` + `PeerStore` + `Close`). The [`storage.NewAdapter`](adapter.go) wrapper bridges that interface into the client's [`Storage`](storage.go) interface.
 
 ### Exporting a Session String
 
