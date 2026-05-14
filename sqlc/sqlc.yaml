@@ -1,0 +1,61 @@
+version: "2"
+sql:
+  - engine: "sqlite"
+    queries: "sqlite/queries.sql"
+    schema: "schema/sqlite_schema.sql"
+    gen:
+      go:
+        package: "sqlite"
+        out: "../sqlite"
+        emit_json_tags: false
+        emit_empty_slices: true
+        emit_methods_with_db_argument: true
+        output_models_file_name: "sqlc_models.go"
+        output_db_file_name: "sqlc_db.go"
+        output_querier_file_name: "sqlc_querier.go"
+        rename:
+          New: "NewSqlcQueries"
+        overrides:
+          - db_type: "BLOB"
+            go_type:
+              type: "byte"
+              slice: true
+          - column: "sessions.test_mode"
+            go_type:
+              type: "int"
+          - column: "sessions.is_bot"
+            go_type:
+              type: "int"
+          - column: "peers.is_bot"
+            go_type:
+              type: "int"
+
+  - engine: "postgresql"
+    queries: "postgres/queries.sql"
+    schema: "schema/postgres_schema.sql"
+    gen:
+      go:
+        package: "postgres"
+        out: "../postgres"
+        emit_json_tags: false
+        emit_empty_slices: true
+        emit_methods_with_db_argument: true
+        output_models_file_name: "sqlc_models.go"
+        output_db_file_name: "sqlc_db.go"
+        output_querier_file_name: "sqlc_querier.go"
+        rename:
+          New: "NewSqlcQueries"
+        overrides:
+          - db_type: "bytea"
+            go_type:
+              type: "byte"
+              slice: true
+          - column: "sessions.test_mode"
+            go_type:
+              type: "int"
+          - column: "sessions.is_bot"
+            go_type:
+              type: "int"
+          - column: "peers.is_bot"
+            go_type:
+              type: "int"
