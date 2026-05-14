@@ -10,10 +10,12 @@ Persistent storage adapters for [mtgo] Telegram clients — session data, peer c
 
 ## Features
 
-- **Three built-in backends**: SQLite (pure-Go, no CGO), PostgreSQL, MongoDB
+- **Six built-in backends**: SQLite (pure-Go, no CGO), PostgreSQL, MongoDB, Redis, GORM, SQLC-generated
+- **In-memory adapter**: `storage.NewMemory()` for testing and short-lived clients
 - **Conformance test suite**: verify custom adapters with `internal/suite`
 - **Conversation plugin support**: optional `ConversationStore` interface
 - **Portable session strings**: export sessions in Telethon/Pyrogram/Kurigram format
+- **Update state and dedup**: durable update queue with retry tracking
 
 ## Installation
 
@@ -122,11 +124,15 @@ Individual sub-suites are also available: `suite.RunSession`, `suite.RunPeers`, 
 ## Architecture
 
 ```
-storage.go          — interfaces and domain types (Session, Peer, Conversation)
+storage.go          — interfaces and domain types (Session, Peer, Conversation, UpdateState)
 adapter.go          — wraps Adapter into the client's Storage interface
+memory.go           — in-memory adapter (NewMemory) for testing
 sqlite/             — SQLite adapter (pure-Go via modernc.org/sqlite)
 postgres/           — PostgreSQL adapter (lib/pq)
 mongodb/            — MongoDB adapter (mongo-driver/v2)
+redis/              — Redis adapter
+gorm/               — GORM adapter
+sqlc/               — SQLC schema and generated queries for sqlite/postgres
 internal/suite/     — conformance test suite for custom adapters
 examples/           — custom adapter examples
 ```
