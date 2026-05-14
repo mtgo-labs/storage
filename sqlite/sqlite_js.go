@@ -42,6 +42,20 @@ func (a *SQLite) DeleteConversation(chatID, userID int64) error { return nil }
 
 func (a *SQLite) Close() error { return nil }
 
+// --- UpdateStateStore (stubs) ---
+
+func (a *SQLite) LoadUpdateState(string) (*storage.UpdateState, error)                { return nil, nil }
+func (a *SQLite) SaveUpdateState(*storage.UpdateState) error                         { return nil }
+func (a *SQLite) LoadChannelUpdateState(string, int64) (*storage.ChannelUpdateState, error) { return nil, nil }
+func (a *SQLite) LoadAllChannelUpdateStates(string) ([]*storage.ChannelUpdateState, error)  { return nil, nil }
+func (a *SQLite) SaveChannelUpdateState(*storage.ChannelUpdateState) error           { return nil }
+func (a *SQLite) SaveUpdateDedupKey(string, string) (bool, error)                    { return true, nil }
+func (a *SQLite) UpdateDedupKeyExists(string, string) (bool, error)                  { return false, nil }
+func (a *SQLite) EnqueueDurableUpdate(*storage.DurableUpdate) error                  { return nil }
+func (a *SQLite) DeleteDurableUpdate(string, string) error                           { return nil }
+func (a *SQLite) LoadDurableUpdates(string, int) ([]*storage.DurableUpdate, error)   { return nil, nil }
+func (a *SQLite) MarkDurableUpdateFailed(string, string, int, string) error          { return nil }
+
 // --- ExportSessionString ---
 
 func ExportSessionString(s *storage.Session) (string, error) {

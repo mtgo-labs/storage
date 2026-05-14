@@ -1,6 +1,7 @@
 package sqlite_test
 
 import (
+	"os"
 	"testing"
 
 	"github.com/mtgo-labs/storage"
@@ -49,4 +50,24 @@ func TestSQLiteConversationsLazy(t *testing.T) {
 
 	var cs storage.ConversationStore = a
 	suite.RunConversations(t, cs)
+}
+
+func TestSQLiteCloseRemovesWALSidecars(t *testing.T) {
+	path := t.TempDir() + "/clean.db"
+	a, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SaveSession(&storage.Session{SessionID: "clean", DC: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(path + suffix); !os.IsNotExist(err) {
+			t.Fatalf("%s exists after Close: %v", path+suffix, err)
+		}
+	}
 }

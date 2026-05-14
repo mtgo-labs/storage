@@ -1,6 +1,6 @@
 module github.com/mtgo-labs/storage/sqlite
 
-go 1.23
+go 1.24
 
 require (
 	github.com/mtgo-labs/storage v0.0.0
