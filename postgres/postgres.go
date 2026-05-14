@@ -1,26 +1,7 @@
-// Package postgres provides a storage adapter backed by a PostgreSQL database.
-//
-// It implements [storage.Adapter] and [storage.ConversationStore]. Session and
-// peer tables are created on Open; the conversations table is created lazily
-// on first use.
-//
-// Basic usage:
-//
-//	store, err := postgres.Open(postgres.Config{
-//	    Host:     "localhost",
-//	    Port:     5432,
-//	    User:     "mtgo",
-//	    Password: "secret",
-//	    Database: "mtgo",
-//	    SSLMode:  "require",
-//	})
-//	if err != nil {
-//	    log.Fatal(err)
-//	}
-//	defer store.Close()
 package postgres
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"sync"
@@ -30,9 +11,12 @@ import (
 	_ "github.com/lib/pq"
 )
 
-// Postgres is a storage adapter backed by a PostgreSQL database.
 type Postgres struct {
 	db        *sql.DB
+	q         *Queries
+	cfg       Config
+	initOnce  sync.Once
+	initErr   error
 	convOnce  sync.Once
 	convReady bool
 }
@@ -40,9 +24,9 @@ type Postgres struct {
 var (
 	_ storage.Adapter           = (*Postgres)(nil)
 	_ storage.ConversationStore = (*Postgres)(nil)
+	_ storage.UpdateStateStore  = (*Postgres)(nil)
 )
 
-// Config holds PostgreSQL connection parameters.
 type Config struct {
 	Host     string
 	Port     int
@@ -61,8 +45,6 @@ func (c Config) dsn() string {
 		c.Host, c.Port, c.User, c.Password, c.Database, ssl)
 }
 
-// Open connects to a PostgreSQL database and initializes the sessions
-// and peers tables. Conversation tables are created lazily when first accessed.
 func Open(cfg Config) (*Postgres, error) {
 	db, err := sql.Open("postgres", cfg.dsn())
 	if err != nil {
@@ -76,12 +58,39 @@ func Open(cfg Config) (*Postgres, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Postgres{db: db}, nil
+	return &Postgres{db: db, q: NewSqlcQueries()}, nil
+}
+
+func New(cfg Config) storage.Storage {
+	return storage.NewAdapter(&Postgres{cfg: cfg, q: NewSqlcQueries()})
+}
+
+func (p *Postgres) init() error {
+	p.initOnce.Do(func() {
+		db, err := sql.Open("postgres", p.cfg.dsn())
+		if err != nil {
+			p.initErr = err
+			return
+		}
+		if err := db.Ping(); err != nil {
+			db.Close()
+			p.initErr = err
+			return
+		}
+		if err := initSchema(db); err != nil {
+			db.Close()
+			p.initErr = err
+			return
+		}
+		p.db = db
+	})
+	return p.initErr
 }
 
 func initSchema(db *sql.DB) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS sessions (
+			session_id     TEXT DEFAULT '',
 			dc_id          INTEGER PRIMARY KEY,
 			api_id         INTEGER DEFAULT 0,
 			api_hash       TEXT DEFAULT '',
@@ -113,6 +122,37 @@ func initSchema(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_peers_username ON peers(username)`,
 		`CREATE INDEX IF NOT EXISTS idx_peers_phone ON peers(phone_number)`,
+		`CREATE TABLE IF NOT EXISTS update_state (
+			session_id TEXT PRIMARY KEY,
+			pts INTEGER NOT NULL DEFAULT 0,
+			qts INTEGER NOT NULL DEFAULT 0,
+			date INTEGER NOT NULL DEFAULT 0,
+			seq INTEGER NOT NULL DEFAULT 0,
+			updated_at BIGINT NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS channel_update_state (
+			session_id TEXT NOT NULL,
+			channel_id BIGINT NOT NULL,
+			pts INTEGER NOT NULL DEFAULT 0,
+			updated_at BIGINT NOT NULL DEFAULT 0,
+			PRIMARY KEY (session_id, channel_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS update_dedup (
+			session_id TEXT NOT NULL,
+			dedup_key TEXT NOT NULL,
+			created_at BIGINT NOT NULL DEFAULT 0,
+			PRIMARY KEY (session_id, dedup_key)
+		)`,
+		`CREATE TABLE IF NOT EXISTS durable_updates (
+			session_id TEXT NOT NULL,
+			id TEXT NOT NULL,
+			payload BYTEA NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at BIGINT NOT NULL DEFAULT 0,
+			updated_at BIGINT NOT NULL DEFAULT 0,
+			PRIMARY KEY (session_id, id)
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
@@ -123,6 +163,9 @@ func initSchema(db *sql.DB) error {
 }
 
 func (p *Postgres) ensureConvTable() error {
+	if err := p.init(); err != nil {
+		return err
+	}
 	if p.convReady {
 		return nil
 	}
@@ -142,18 +185,27 @@ func (p *Postgres) ensureConvTable() error {
 	return err
 }
 
+func (p *Postgres) Close() error {
+	if err := p.init(); err != nil {
+		return err
+	}
+	return p.db.Close()
+}
+
 // --- SessionStore ---
 
-func (p *Postgres) LoadSession() (*storage.Session, error) {
-	var dcID, apiID, date, port int
-	var testMode, isBot int
-	var authKey, state []byte
-	var userID int64
-	var apiHash, firstName, lastName, username, serverAddress string
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
 
-	err := p.db.QueryRow(
-		`SELECT dc_id, api_id, api_hash, test_mode, auth_key, state, user_id, is_bot, first_name, last_name, username, date, server_address, port FROM sessions LIMIT 1`,
-	).Scan(&dcID, &apiID, &apiHash, &testMode, &authKey, &state, &userID, &isBot, &firstName, &lastName, &username, &date, &serverAddress, &port)
+func (p *Postgres) LoadSession() (*storage.Session, error) {
+	if err := p.init(); err != nil {
+		return nil, err
+	}
+	row, err := p.q.GetSession(context.Background(), p.db)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -161,112 +213,104 @@ func (p *Postgres) LoadSession() (*storage.Session, error) {
 		return nil, err
 	}
 	return &storage.Session{
-		DC: dcID, APIID: apiID, APIHash: apiHash, TestMode: testMode != 0,
-		AuthKey: authKey, State: state, UserID: userID, IsBot: isBot != 0,
-		FirstName: firstName, LastName: lastName, Username: username,
-		Date: date, Addr: serverAddress, Port: port,
+		SessionID: row.SessionID, DC: int(row.DcID), APIID: int32(row.ApiID),
+		APIHash: row.ApiHash, TestMode: row.TestMode != 0,
+		AuthKey: row.AuthKey, State: row.State, UserID: row.UserID,
+		IsBot: row.IsBot != 0, FirstName: row.FirstName, LastName: row.LastName,
+		Username: row.Username, Date: int(row.Date), Addr: row.ServerAddress, Port: int(row.Port),
 	}, nil
 }
 
 func (p *Postgres) SaveSession(s *storage.Session) error {
-	tm := 0
-	if s.TestMode {
-		tm = 1
+	if err := p.init(); err != nil {
+		return err
 	}
-	ib := 0
-	if s.IsBot {
-		ib = 1
-	}
-	_, err := p.db.Exec(`INSERT INTO sessions
-		(dc_id, api_id, api_hash, test_mode, auth_key, state, user_id, is_bot, first_name, last_name, username, date, server_address, port)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-		ON CONFLICT (dc_id) DO UPDATE SET
-			api_id = EXCLUDED.api_id, api_hash = EXCLUDED.api_hash, test_mode = EXCLUDED.test_mode,
-			auth_key = EXCLUDED.auth_key, state = EXCLUDED.state, user_id = EXCLUDED.user_id,
-			is_bot = EXCLUDED.is_bot, first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name,
-			username = EXCLUDED.username, date = EXCLUDED.date, server_address = EXCLUDED.server_address, port = EXCLUDED.port`,
-		s.DC, s.APIID, s.APIHash, tm, s.AuthKey, s.State, s.UserID, ib,
-		s.FirstName, s.LastName, s.Username, s.Date, s.Addr, s.Port)
-	return err
+	return p.q.UpsertSession(context.Background(), p.db, UpsertSessionParams{
+		SessionID: s.SessionID, DcID: int32(s.DC), ApiID: s.APIID,
+		ApiHash: s.APIHash, TestMode: boolToInt(s.TestMode),
+		AuthKey: s.AuthKey, State: s.State, UserID: s.UserID,
+		IsBot: boolToInt(s.IsBot), FirstName: s.FirstName, LastName: s.LastName,
+		Username: s.Username, Date: int32(s.Date), ServerAddress: s.Addr, Port: int32(s.Port),
+	})
 }
 
 // --- PeerStore ---
 
 func (p *Postgres) SavePeer(peer *storage.Peer) error {
-	ib := 0
-	if peer.IsBot {
-		ib = 1
+	if err := p.init(); err != nil {
+		return err
 	}
-	_, err := p.db.Exec(`INSERT INTO peers
-		(id, type, access_hash, username, usernames, first_name, last_name, phone_number, is_bot, photo_id, language, last_updated)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-		ON CONFLICT (id) DO UPDATE SET
-			type = EXCLUDED.type, access_hash = EXCLUDED.access_hash, username = EXCLUDED.username,
-			usernames = EXCLUDED.usernames, first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name,
-			phone_number = EXCLUDED.phone_number, is_bot = EXCLUDED.is_bot, photo_id = EXCLUDED.photo_id,
-			language = EXCLUDED.language, last_updated = EXCLUDED.last_updated`,
-		peer.ID, peer.Type, peer.AccessHash, peer.Username, peer.Usernames, peer.FirstName, peer.LastName,
-		peer.PhoneNumber, ib, peer.PhotoID, peer.Language, peer.LastUpdated)
-	return err
+	return p.q.UpsertPeer(context.Background(), p.db, UpsertPeerParams{
+		ID: peer.ID, Type: int32(peer.Type), AccessHash: peer.AccessHash,
+		Username: peer.Username, Usernames: peer.Usernames, FirstName: peer.FirstName,
+		LastName: peer.LastName, PhoneNumber: peer.PhoneNumber, IsBot: boolToInt(peer.IsBot),
+		PhotoID: peer.PhotoID, Language: peer.Language, LastUpdated: peer.LastUpdated,
+	})
 }
 
 func (p *Postgres) GetPeer(id int64) (*storage.Peer, error) {
-	peer := &storage.Peer{}
-	var isBot int
-	err := p.db.QueryRow(
-		`SELECT id, type, access_hash, username, usernames, first_name, last_name, phone_number, is_bot, photo_id, language, last_updated FROM peers WHERE id = $1`, id).
-		Scan(&peer.ID, &peer.Type, &peer.AccessHash, &peer.Username, &peer.Usernames, &peer.FirstName, &peer.LastName,
-			&peer.PhoneNumber, &isBot, &peer.PhotoID, &peer.Language, &peer.LastUpdated)
+	if err := p.init(); err != nil {
+		return nil, err
+	}
+	row, err := p.q.GetPeer(context.Background(), p.db, id)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	peer.IsBot = isBot != 0
-	return peer, nil
+	return &storage.Peer{
+		ID: row.ID, Type: storage.PeerType(row.Type), AccessHash: row.AccessHash,
+		Username: row.Username, Usernames: row.Usernames, FirstName: row.FirstName,
+		LastName: row.LastName, PhoneNumber: row.PhoneNumber, IsBot: row.IsBot != 0,
+		PhotoID: row.PhotoID, Language: row.Language, LastUpdated: row.LastUpdated,
+	}, nil
 }
 
 func (p *Postgres) GetPeerByUsername(username string) (*storage.Peer, error) {
-	peer := &storage.Peer{}
-	var isBot int
-	err := p.db.QueryRow(
-		`SELECT id, type, access_hash, username, usernames, first_name, last_name, phone_number, is_bot, photo_id, language, last_updated FROM peers WHERE username = $1`, username).
-		Scan(&peer.ID, &peer.Type, &peer.AccessHash, &peer.Username, &peer.Usernames, &peer.FirstName, &peer.LastName,
-			&peer.PhoneNumber, &isBot, &peer.PhotoID, &peer.Language, &peer.LastUpdated)
+	if err := p.init(); err != nil {
+		return nil, err
+	}
+	row, err := p.q.GetPeerByUsername(context.Background(), p.db, username)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	peer.IsBot = isBot != 0
-	return peer, nil
+	return &storage.Peer{
+		ID: row.ID, Type: storage.PeerType(row.Type), AccessHash: row.AccessHash,
+		Username: row.Username, Usernames: row.Usernames, FirstName: row.FirstName,
+		LastName: row.LastName, PhoneNumber: row.PhoneNumber, IsBot: row.IsBot != 0,
+		PhotoID: row.PhotoID, Language: row.Language, LastUpdated: row.LastUpdated,
+	}, nil
 }
 
 func (p *Postgres) LoadPeers() ([]*storage.Peer, error) {
-	rows, err := p.db.Query(`SELECT id, type, access_hash, username, usernames, first_name, last_name, phone_number, is_bot, photo_id, language, last_updated FROM peers`)
+	if err := p.init(); err != nil {
+		return nil, err
+	}
+	rows, err := p.q.ListPeers(context.Background(), p.db)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var peers []*storage.Peer
-	for rows.Next() {
-		peer := &storage.Peer{}
-		var isBot int
-		if err := rows.Scan(&peer.ID, &peer.Type, &peer.AccessHash, &peer.Username, &peer.Usernames, &peer.FirstName, &peer.LastName,
-			&peer.PhoneNumber, &isBot, &peer.PhotoID, &peer.Language, &peer.LastUpdated); err != nil {
-			return nil, err
+	out := make([]*storage.Peer, len(rows))
+	for i, r := range rows {
+		out[i] = &storage.Peer{
+			ID: r.ID, Type: storage.PeerType(r.Type), AccessHash: r.AccessHash,
+			Username: r.Username, Usernames: r.Usernames, FirstName: r.FirstName,
+			LastName: r.LastName, PhoneNumber: r.PhoneNumber, IsBot: r.IsBot != 0,
+			PhotoID: r.PhotoID, Language: r.Language, LastUpdated: r.LastUpdated,
 		}
-		peer.IsBot = isBot != 0
-		peers = append(peers, peer)
 	}
-	return peers, nil
+	return out, nil
 }
 
 func (p *Postgres) DeletePeer(id int64) error {
-	_, err := p.db.Exec(`DELETE FROM peers WHERE id = $1`, id)
-	return err
+	if err := p.init(); err != nil {
+		return err
+	}
+	return p.q.DeletePeer(context.Background(), p.db, id)
 }
 
 // --- ConversationStore (lazy) ---
@@ -283,43 +327,184 @@ func (p *Postgres) SaveConversation(c *storage.Conversation) error {
 	if createdAt == 0 {
 		createdAt = now
 	}
-	_, err := p.db.Exec(`INSERT INTO conversations
-		(chat_id, user_id, name, step, data, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (chat_id, user_id) DO UPDATE SET
-			name = EXCLUDED.name, step = EXCLUDED.step, data = EXCLUDED.data,
-			created_at = EXCLUDED.created_at, updated_at = EXCLUDED.updated_at`,
-		c.ChatID, c.UserID, c.Name, c.Step, c.Data, createdAt, now)
-	return err
+	return p.q.UpsertConversation(context.Background(), p.db, UpsertConversationParams{
+		ChatID: c.ChatID, UserID: c.UserID, Name: c.Name, Step: int32(c.Step),
+		Data: c.Data, CreatedAt: createdAt, UpdatedAt: now,
+	})
 }
 
 func (p *Postgres) LoadConversation(chatID, userID int64) (*storage.Conversation, error) {
 	if err := p.ensureConvTable(); err != nil {
 		return nil, err
 	}
-	c := &storage.Conversation{}
-	err := p.db.QueryRow(
-		`SELECT chat_id, user_id, name, step, data, created_at, updated_at FROM conversations WHERE chat_id = $1 AND user_id = $2`, chatID, userID).
-		Scan(&c.ChatID, &c.UserID, &c.Name, &c.Step, &c.Data, &c.CreatedAt, &c.UpdatedAt)
+	row, err := p.q.GetConversation(context.Background(), p.db, GetConversationParams{
+		ChatID: chatID, UserID: userID,
+	})
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return c, nil
+	return &storage.Conversation{
+		ChatID: row.ChatID, UserID: row.UserID, Name: row.Name,
+		Step: int(row.Step), Data: row.Data, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
+	}, nil
 }
 
 func (p *Postgres) DeleteConversation(chatID, userID int64) error {
 	if err := p.ensureConvTable(); err != nil {
 		return err
 	}
-	_, err := p.db.Exec(`DELETE FROM conversations WHERE chat_id = $1 AND user_id = $2`, chatID, userID)
-	return err
+	return p.q.DeleteConversation(context.Background(), p.db, DeleteConversationParams{
+		ChatID: chatID, UserID: userID,
+	})
 }
 
-// --- Close ---
+// --- UpdateStateStore ---
 
-func (p *Postgres) Close() error {
-	return p.db.Close()
+func (p *Postgres) LoadUpdateState(sessionID string) (*storage.UpdateState, error) {
+	if err := p.init(); err != nil {
+		return nil, err
+	}
+	row, err := p.q.GetUpdateState(context.Background(), p.db, sessionID)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &storage.UpdateState{
+		SessionID: row.SessionID, Pts: row.Pts, Qts: row.Qts,
+		Date: row.Date, Seq: row.Seq,
+	}, nil
+}
+
+func (p *Postgres) SaveUpdateState(s *storage.UpdateState) error {
+	if err := p.init(); err != nil {
+		return err
+	}
+	return p.q.UpsertUpdateState(context.Background(), p.db, UpsertUpdateStateParams{
+		SessionID: s.SessionID, Pts: s.Pts, Qts: s.Qts,
+		Date: s.Date, Seq: s.Seq, UpdatedAt: time.Now().Unix(),
+	})
+}
+
+func (p *Postgres) LoadChannelUpdateState(sessionID string, channelID int64) (*storage.ChannelUpdateState, error) {
+	if err := p.init(); err != nil {
+		return nil, err
+	}
+	row, err := p.q.GetChannelUpdateState(context.Background(), p.db, GetChannelUpdateStateParams{
+		SessionID: sessionID, ChannelID: channelID,
+	})
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &storage.ChannelUpdateState{
+		SessionID: row.SessionID, ChannelID: row.ChannelID, Pts: row.Pts,
+	}, nil
+}
+
+func (p *Postgres) LoadAllChannelUpdateStates(sessionID string) ([]*storage.ChannelUpdateState, error) {
+	if err := p.init(); err != nil {
+		return nil, err
+	}
+	rows, err := p.q.ListChannelUpdateStates(context.Background(), p.db, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*storage.ChannelUpdateState, len(rows))
+	for i, r := range rows {
+		out[i] = &storage.ChannelUpdateState{
+			SessionID: r.SessionID, ChannelID: r.ChannelID, Pts: r.Pts,
+		}
+	}
+	return out, nil
+}
+
+func (p *Postgres) SaveChannelUpdateState(s *storage.ChannelUpdateState) error {
+	if err := p.init(); err != nil {
+		return err
+	}
+	return p.q.UpsertChannelUpdateState(context.Background(), p.db, UpsertChannelUpdateStateParams{
+		SessionID: s.SessionID, ChannelID: s.ChannelID, Pts: s.Pts,
+		UpdatedAt: time.Now().Unix(),
+	})
+}
+
+func (p *Postgres) SaveUpdateDedupKey(sessionID string, key string) (bool, error) {
+	if err := p.init(); err != nil {
+		return false, err
+	}
+	n, err := p.q.InsertDedupKey(context.Background(), p.db, InsertDedupKeyParams{
+		SessionID: sessionID, DedupKey: key, CreatedAt: time.Now().Unix(),
+	})
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+func (p *Postgres) UpdateDedupKeyExists(sessionID string, key string) (bool, error) {
+	if err := p.init(); err != nil {
+		return false, err
+	}
+	count, err := p.q.ExistsDedupKey(context.Background(), p.db, ExistsDedupKeyParams{
+		SessionID: sessionID, DedupKey: key,
+	})
+	return count > 0, err
+}
+
+func (p *Postgres) EnqueueDurableUpdate(u *storage.DurableUpdate) error {
+	if err := p.init(); err != nil {
+		return err
+	}
+	return p.q.UpsertDurableUpdate(context.Background(), p.db, UpsertDurableUpdateParams{
+		SessionID: u.SessionID, ID: u.ID, Payload: u.Payload,
+		Attempts: int32(u.Attempts), LastError: u.LastError,
+		CreatedAt: u.CreatedAt, UpdatedAt: time.Now().Unix(),
+	})
+}
+
+func (p *Postgres) DeleteDurableUpdate(sessionID string, id string) error {
+	if err := p.init(); err != nil {
+		return err
+	}
+	return p.q.DeleteDurableUpdate(context.Background(), p.db, DeleteDurableUpdateParams{
+		SessionID: sessionID, ID: id,
+	})
+}
+
+func (p *Postgres) LoadDurableUpdates(sessionID string, limit int) ([]*storage.DurableUpdate, error) {
+	if err := p.init(); err != nil {
+		return nil, err
+	}
+	rows, err := p.q.ListDurableUpdates(context.Background(), p.db, ListDurableUpdatesParams{
+		SessionID: sessionID, Limit: int32(limit),
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*storage.DurableUpdate, len(rows))
+	for i, r := range rows {
+		out[i] = &storage.DurableUpdate{
+			SessionID: r.SessionID, ID: r.ID, Payload: r.Payload,
+			Attempts: int(r.Attempts), LastError: r.LastError,
+			CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+		}
+	}
+	return out, nil
+}
+
+func (p *Postgres) MarkDurableUpdateFailed(sessionID string, id string, attempts int, lastErr string) error {
+	if err := p.init(); err != nil {
+		return err
+	}
+	return p.q.MarkDurableUpdateFailed(context.Background(), p.db, MarkDurableUpdateFailedParams{
+		Attempts: int32(attempts), LastError: lastErr, UpdatedAt: time.Now().Unix(),
+		SessionID: sessionID, ID: id,
+	})
 }
