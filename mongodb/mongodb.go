@@ -29,8 +29,11 @@ import (
 
 // MongoDB is a storage adapter backed by a MongoDB database.
 type MongoDB struct {
-	client *mongo.Client
-	db     *mongo.Database
+	client   *mongo.Client
+	db       *mongo.Database
+	cfg      Config
+	initOnce sync.Once
+	initErr  error
 
 	convOnce  sync.Once
 	convReady bool
@@ -39,6 +42,7 @@ type MongoDB struct {
 var (
 	_ storage.Adapter           = (*MongoDB)(nil)
 	_ storage.ConversationStore = (*MongoDB)(nil)
+	_ storage.UpdateStateStore  = (*MongoDB)(nil)
 )
 
 // Config holds MongoDB connection parameters.
@@ -67,11 +71,53 @@ func Open(ctx context.Context, cfg Config) (*MongoDB, error) {
 	_, _ = db.Collection("conversations").Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{{Key: "chat_id", Value: 1}, {Key: "user_id", Value: 1}},
 	})
+	_, _ = db.Collection("channel_update_state").Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "session_id", Value: 1}, {Key: "channel_id", Value: 1}},
+	})
+	_, _ = db.Collection("update_dedup").Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "session_id", Value: 1}, {Key: "dedup_key", Value: 1}},
+	})
 
 	return &MongoDB{client: client, db: db}, nil
 }
 
-func (m *MongoDB) ensureConvColl(ctx context.Context) {
+func New(cfg Config) storage.Storage {
+	return storage.NewAdapter(&MongoDB{cfg: cfg})
+}
+
+func (m *MongoDB) init() error {
+	m.initOnce.Do(func() {
+		ctx := context.Background()
+		client, err := mongo.Connect(options.Client().ApplyURI(m.cfg.URI))
+		if err != nil {
+			m.initErr = err
+			return
+		}
+		if err := client.Ping(ctx, nil); err != nil {
+			client.Disconnect(ctx)
+			m.initErr = err
+			return
+		}
+		db := client.Database(m.cfg.Database)
+		_, _ = db.Collection("peers").Indexes().CreateOne(ctx, mongo.IndexModel{
+			Keys: bson.D{{Key: "username", Value: 1}},
+		})
+		_, _ = db.Collection("conversations").Indexes().CreateOne(ctx, mongo.IndexModel{
+			Keys: bson.D{{Key: "chat_id", Value: 1}, {Key: "user_id", Value: 1}},
+		})
+		_, _ = db.Collection("channel_update_state").Indexes().CreateOne(ctx, mongo.IndexModel{
+			Keys: bson.D{{Key: "session_id", Value: 1}, {Key: "channel_id", Value: 1}},
+		})
+		_, _ = db.Collection("update_dedup").Indexes().CreateOne(ctx, mongo.IndexModel{
+			Keys: bson.D{{Key: "session_id", Value: 1}, {Key: "dedup_key", Value: 1}},
+		})
+		m.client = client
+		m.db = db
+	})
+	return m.initErr
+}
+
+func (m *MongoDB) ensureConvColl() {
 	m.convOnce.Do(func() {
 		m.convReady = true
 	})
@@ -80,10 +126,13 @@ func (m *MongoDB) ensureConvColl(ctx context.Context) {
 // --- SessionStore ---
 
 func (m *MongoDB) LoadSession() (*storage.Session, error) {
+	if err := m.init(); err != nil {
+		return nil, err
+	}
 	coll := m.db.Collection("sessions")
 	var doc struct {
 		DC            int    `bson:"dc_id"`
-		APIID         int    `bson:"api_id"`
+		APIID         int32  `bson:"api_id"`
 		APIHash       string `bson:"api_hash"`
 		TestMode      int    `bson:"test_mode"`
 		AuthKey       []byte `bson:"auth_key"`
@@ -113,6 +162,9 @@ func (m *MongoDB) LoadSession() (*storage.Session, error) {
 }
 
 func (m *MongoDB) SaveSession(s *storage.Session) error {
+	if err := m.init(); err != nil {
+		return err
+	}
 	coll := m.db.Collection("sessions")
 	tm := 0
 	if s.TestMode {
@@ -135,6 +187,9 @@ func (m *MongoDB) SaveSession(s *storage.Session) error {
 // --- PeerStore ---
 
 func (m *MongoDB) SavePeer(p *storage.Peer) error {
+	if err := m.init(); err != nil {
+		return err
+	}
 	coll := m.db.Collection("peers")
 	ib := 0
 	if p.IsBot {
@@ -151,6 +206,9 @@ func (m *MongoDB) SavePeer(p *storage.Peer) error {
 }
 
 func (m *MongoDB) GetPeer(id int64) (*storage.Peer, error) {
+	if err := m.init(); err != nil {
+		return nil, err
+	}
 	coll := m.db.Collection("peers")
 	var doc struct {
 		ID          int64  `bson:"_id"`
@@ -182,6 +240,9 @@ func (m *MongoDB) GetPeer(id int64) (*storage.Peer, error) {
 }
 
 func (m *MongoDB) GetPeerByUsername(username string) (*storage.Peer, error) {
+	if err := m.init(); err != nil {
+		return nil, err
+	}
 	coll := m.db.Collection("peers")
 	var doc struct {
 		ID          int64  `bson:"_id"`
@@ -213,6 +274,9 @@ func (m *MongoDB) GetPeerByUsername(username string) (*storage.Peer, error) {
 }
 
 func (m *MongoDB) LoadPeers() ([]*storage.Peer, error) {
+	if err := m.init(); err != nil {
+		return nil, err
+	}
 	coll := m.db.Collection("peers")
 	cursor, err := coll.Find(context.Background(), bson.M{})
 	if err != nil {
@@ -249,6 +313,9 @@ func (m *MongoDB) LoadPeers() ([]*storage.Peer, error) {
 }
 
 func (m *MongoDB) DeletePeer(id int64) error {
+	if err := m.init(); err != nil {
+		return err
+	}
 	coll := m.db.Collection("peers")
 	_, err := coll.DeleteOne(context.Background(), bson.M{"_id": id})
 	return err
@@ -257,7 +324,10 @@ func (m *MongoDB) DeletePeer(id int64) error {
 // --- ConversationStore (lazy) ---
 
 func (m *MongoDB) SaveConversation(c *storage.Conversation) error {
-	m.ensureConvColl(context.Background())
+	if err := m.init(); err != nil {
+		return err
+	}
+	m.ensureConvColl()
 	coll := m.db.Collection("conversations")
 	now := c.UpdatedAt
 	if now == 0 {
@@ -280,7 +350,10 @@ func (m *MongoDB) SaveConversation(c *storage.Conversation) error {
 }
 
 func (m *MongoDB) LoadConversation(chatID, userID int64) (*storage.Conversation, error) {
-	m.ensureConvColl(context.Background())
+	if err := m.init(); err != nil {
+		return nil, err
+	}
+	m.ensureConvColl()
 	coll := m.db.Collection("conversations")
 	var doc struct {
 		ChatID    int64  `bson:"chat_id"`
@@ -305,9 +378,143 @@ func (m *MongoDB) LoadConversation(chatID, userID int64) (*storage.Conversation,
 }
 
 func (m *MongoDB) DeleteConversation(chatID, userID int64) error {
-	m.ensureConvColl(context.Background())
+	if err := m.init(); err != nil {
+		return err
+	}
+	m.ensureConvColl()
 	coll := m.db.Collection("conversations")
 	_, err := coll.DeleteOne(context.Background(), bson.M{"chat_id": chatID, "user_id": userID})
+	return err
+}
+
+// --- UpdateStateStore ---
+
+func (m *MongoDB) LoadUpdateState(sessionID string) (*storage.UpdateState, error) {
+	var doc struct {
+		SessionID string `bson:"session_id"`
+		Pts       int32  `bson:"pts"`
+		Qts       int32  `bson:"qts"`
+		Date      int32  `bson:"date"`
+		Seq       int32  `bson:"seq"`
+	}
+	err := m.db.Collection("update_state").FindOne(context.Background(), bson.M{"session_id": sessionID}).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &storage.UpdateState{SessionID: doc.SessionID, Pts: doc.Pts, Qts: doc.Qts, Date: doc.Date, Seq: doc.Seq}, nil
+}
+
+func (m *MongoDB) SaveUpdateState(s *storage.UpdateState) error {
+	doc := bson.M{"pts": s.Pts, "qts": s.Qts, "date": s.Date, "seq": s.Seq, "updated_at": time.Now().Unix()}
+	_, err := m.db.Collection("update_state").ReplaceOne(context.Background(), bson.M{"session_id": s.SessionID}, doc, options.Replace().SetUpsert(true))
+	return err
+}
+
+func (m *MongoDB) LoadChannelUpdateState(sessionID string, channelID int64) (*storage.ChannelUpdateState, error) {
+	var doc struct {
+		SessionID string `bson:"session_id"`
+		ChannelID int64  `bson:"channel_id"`
+		Pts       int32  `bson:"pts"`
+	}
+	err := m.db.Collection("channel_update_state").FindOne(context.Background(), bson.M{"session_id": sessionID, "channel_id": channelID}).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &storage.ChannelUpdateState{SessionID: doc.SessionID, ChannelID: doc.ChannelID, Pts: doc.Pts}, nil
+}
+
+func (m *MongoDB) LoadAllChannelUpdateStates(sessionID string) ([]*storage.ChannelUpdateState, error) {
+	cursor, err := m.db.Collection("channel_update_state").Find(context.Background(), bson.M{"session_id": sessionID})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(context.Background())
+	var out []*storage.ChannelUpdateState
+	for cursor.Next(context.Background()) {
+		var doc struct {
+			SessionID string `bson:"session_id"`
+			ChannelID int64  `bson:"channel_id"`
+			Pts       int32  `bson:"pts"`
+		}
+		if err := cursor.Decode(&doc); err != nil {
+			return nil, err
+		}
+		out = append(out, &storage.ChannelUpdateState{SessionID: doc.SessionID, ChannelID: doc.ChannelID, Pts: doc.Pts})
+	}
+	return out, nil
+}
+
+func (m *MongoDB) SaveChannelUpdateState(s *storage.ChannelUpdateState) error {
+	doc := bson.M{"pts": s.Pts, "updated_at": time.Now().Unix()}
+	_, err := m.db.Collection("channel_update_state").ReplaceOne(context.Background(), bson.M{"session_id": s.SessionID, "channel_id": s.ChannelID}, doc, options.Replace().SetUpsert(true))
+	return err
+}
+
+func (m *MongoDB) SaveUpdateDedupKey(sessionID string, key string) (bool, error) {
+	doc := bson.M{"created_at": time.Now().Unix()}
+	res, err := m.db.Collection("update_dedup").ReplaceOne(context.Background(), bson.M{"session_id": sessionID, "dedup_key": key}, doc, options.Replace().SetUpsert(true))
+	if err != nil {
+		return false, err
+	}
+	return res.UpsertedCount > 0, nil
+}
+
+func (m *MongoDB) UpdateDedupKeyExists(sessionID string, key string) (bool, error) {
+	count, err := m.db.Collection("update_dedup").CountDocuments(context.Background(), bson.M{"session_id": sessionID, "dedup_key": key})
+	return count > 0, err
+}
+
+func (m *MongoDB) EnqueueDurableUpdate(u *storage.DurableUpdate) error {
+	doc := bson.M{"payload": u.Payload, "attempts": u.Attempts, "last_error": u.LastError, "created_at": u.CreatedAt, "updated_at": time.Now().Unix()}
+	_, err := m.db.Collection("durable_updates").ReplaceOne(context.Background(), bson.M{"session_id": u.SessionID, "id": u.ID}, doc, options.Replace().SetUpsert(true))
+	return err
+}
+
+func (m *MongoDB) DeleteDurableUpdate(sessionID string, id string) error {
+	_, err := m.db.Collection("durable_updates").DeleteOne(context.Background(), bson.M{"session_id": sessionID, "id": id})
+	return err
+}
+
+func (m *MongoDB) LoadDurableUpdates(sessionID string, limit int) ([]*storage.DurableUpdate, error) {
+	opts := options.Find().SetSort(bson.D{{Key: "created_at", Value: 1}}).SetLimit(int64(limit))
+	cursor, err := m.db.Collection("durable_updates").Find(context.Background(), bson.M{"session_id": sessionID}, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(context.Background())
+	var out []*storage.DurableUpdate
+	for cursor.Next(context.Background()) {
+		var doc struct {
+			SessionID string `bson:"session_id"`
+			ID        string `bson:"id"`
+			Payload   []byte `bson:"payload"`
+			Attempts  int    `bson:"attempts"`
+			LastError string `bson:"last_error"`
+			CreatedAt int64  `bson:"created_at"`
+			UpdatedAt int64  `bson:"updated_at"`
+		}
+		if err := cursor.Decode(&doc); err != nil {
+			return nil, err
+		}
+		out = append(out, &storage.DurableUpdate{
+			SessionID: doc.SessionID, ID: doc.ID, Payload: doc.Payload,
+			Attempts: doc.Attempts, LastError: doc.LastError,
+			CreatedAt: doc.CreatedAt, UpdatedAt: doc.UpdatedAt,
+		})
+	}
+	return out, nil
+}
+
+func (m *MongoDB) MarkDurableUpdateFailed(sessionID string, id string, attempts int, lastErr string) error {
+	_, err := m.db.Collection("durable_updates").UpdateOne(context.Background(),
+		bson.M{"session_id": sessionID, "id": id},
+		bson.M{"$set": bson.M{"attempts": attempts, "last_error": lastErr, "updated_at": time.Now().Unix()}})
 	return err
 }
 
