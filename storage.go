@@ -65,8 +65,9 @@ func (p PeerType) String() string {
 
 // Session holds MTProto session data.
 type Session struct {
+	SessionID string `json:"session_id"`
 	DC        int    `json:"dc"`
-	APIID     int    `json:"api_id"`
+	APIID     int32  `json:"api_id"`
 	APIHash   string `json:"api_hash"`
 	TestMode  bool   `json:"test_mode"`
 	AuthKey   []byte `json:"auth_key"`
@@ -167,11 +168,14 @@ type DCAuthStore interface {
 //	    Storage: storage.NewAdapter(store),
 //	})
 type Storage interface {
+	SessionID() (string, error)
+	SetSessionID(string) error
+
 	DCID() (int, error)
 	SetDCID(int) error
 
-	APIID() (int, error)
-	SetAPIID(int) error
+	APIID() (int32, error)
+	SetAPIID(int32) error
 
 	APIHash() (string, error)
 	SetAPIHash(string) error
@@ -244,6 +248,52 @@ type PeerEntry struct {
 	PhotoID     int64    `json:"photo_id,omitempty"`
 	Language    string   `json:"language,omitempty"`
 	LastUpdated int64    `json:"last_updated,omitempty"`
+}
+
+type UpdateState struct {
+	SessionID string `json:"session_id"`
+	Pts       int32  `json:"pts"`
+	Qts       int32  `json:"qts"`
+	Date      int32  `json:"date"`
+	Seq       int32  `json:"seq"`
+}
+
+type ChannelUpdateState struct {
+	SessionID string `json:"session_id"`
+	ChannelID int64  `json:"channel_id"`
+	Pts       int32  `json:"pts"`
+}
+
+type DurableUpdate struct {
+	SessionID string `json:"session_id"`
+	ID        string `json:"id"`
+	Payload   []byte `json:"payload"`
+	Attempts  int    `json:"attempts"`
+	LastError string `json:"last_error"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+type UpdateStateStore interface {
+	LoadUpdateState(sessionID string) (*UpdateState, error)
+	SaveUpdateState(state *UpdateState) error
+	LoadChannelUpdateState(sessionID string, channelID int64) (*ChannelUpdateState, error)
+	LoadAllChannelUpdateStates(sessionID string) ([]*ChannelUpdateState, error)
+	SaveChannelUpdateState(state *ChannelUpdateState) error
+	SaveUpdateDedupKey(sessionID string, key string) (bool, error)
+	UpdateDedupKeyExists(sessionID string, key string) (bool, error)
+	EnqueueDurableUpdate(update *DurableUpdate) error
+	DeleteDurableUpdate(sessionID string, id string) error
+	LoadDurableUpdates(sessionID string, limit int) ([]*DurableUpdate, error)
+	MarkDurableUpdateFailed(sessionID string, id string, attempts int, lastErr string) error
+}
+
+// SessionIDAware is an optional interface that adapters can implement to
+// receive the session name from the client. The client calls SetSessionName
+// early in connectTransport, before any data access, so the adapter can
+// scope its queries accordingly.
+type SessionIDAware interface {
+	SetSessionName(name string)
 }
 
 // MustMarshal marshals v to JSON, panicking on error.
